@@ -2,7 +2,7 @@
 arc: 48
 title: Deployment Freeze by Validator Vote
 authors: ProvableHQ
-discussion:
+discussion: https://github.com/aleo-labs-protocol/ARCs/discussions/148
 topic: Protocol
 status: Draft
 created: 2026-11-17
