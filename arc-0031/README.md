@@ -9,9 +9,9 @@ created: 2026-10-19
 signature_domain: aleo-gov-31-v1
 pass_threshold: 66
 quorum_threshold: 66
-voting_start: 23386000
-voting_end: 23686000
-snapshot: 23686000
+voting_start: 23855000
+voting_end: 24157000
+snapshot: 24157000
 ---
 
 ## Abstract
