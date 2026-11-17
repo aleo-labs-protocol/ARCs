@@ -1,10 +1,10 @@
 ---
 arc: 31
 title: Exchange Addresses
-authors: Chris Beck <chris@aleolabs.io>, Stark Ridiesel <stark@aleolabs.io>, Alex Kim <alex@aleolabs.io>, John Reynolds <john@aleolabs.io>
+authors: Aleo Labs
 discussion: https://github.com/aleo-labs-protocol/ARCs/discussions/145
 topic: Application
-status: Draft
+status: Active
 created: 2026-10-19
 signature_domain: aleo-gov-31-v1
 pass_threshold: 66
