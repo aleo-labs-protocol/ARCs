@@ -164,7 +164,10 @@ The release must not ship before step 1 is confirmed: from `V_F`, the program ca
 
 ## Reference Implementations
 
-A proof of concept of `deployment_freeze.aleo` produced the measurements above. Links to it and to the snarkVM and snarkOS changes will be added.
+Draft implementations (the proof of concept targets `V24` for `V_F`):
+
+- **snarkVM:** [aleo-labs-protocol/snarkVM-internal#68](https://github.com/aleo-labs-protocol/snarkVM-internal/pull/68): freeze deployments by validator vote.
+- **snarkOS:** [aleo-labs-protocol/snarkOS-internal#18](https://github.com/aleo-labs-protocol/snarkOS-internal/pull/18): turn deployments away during a freeze.
 
 ## Dependencies
 
