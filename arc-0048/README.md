@@ -1,10 +1,10 @@
 ---
 arc: 48
 title: Deployment Freeze by Validator Vote
-authors: ProvableHQ
+authors: Aleo Labs
 discussion: https://github.com/aleo-labs-protocol/ARCs/discussions/148
 topic: Protocol
-status: Draft
+status: Active
 created: 2026-11-17
 signature_domain: aleo-gov-48-v1
 pass_threshold: 66
