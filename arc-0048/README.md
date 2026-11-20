@@ -18,7 +18,8 @@ snapshot: 24157000
 
 This ARC lets validators pause program deployments for a bounded time by an on-chain, stake-weighted vote, without a network upgrade.
 
-- A new, non-upgradable program, `deployment_freeze.aleo`, records validator votes. The vote that takes support past two thirds of committee stake sets a freeze window.
+- Validators vote by signing a short message with the existing `snarkos account sign` command, as they already do for ARC votes. They need no credits and send no transactions. Anyone can collect the signatures and submit them in one transaction.
+- A new program, `aleo_deployment_freeze.aleo`, built into the protocol like `credits.aleo`, checks the signatures and tallies them by stake. A submission carrying more than two thirds of committee stake sets a freeze window.
 - From consensus version `V_F`, every deployment (new program, upgrade, or amendment) that reaches a block during a freeze is **rejected without being verified, and its fee is charged**.
 - Nodes stop accepting deployments from the block after the vote passes. The freeze starts 60 blocks (~3 minutes) later, so deployments already in flight are not caught.
 - A freeze lasts at most ~7 days and expires unless renewed. The same quorum can thaw it early.
@@ -41,7 +42,7 @@ Today the only way to stop deployments is a new consensus version, a release, an
 | Threshold (freeze and thaw) | `total * 2 / 3 + 1` of committee stake (`Committee::quorum_threshold`) |
 | `MAX_FREEZE_BLOCKS` | 201,600 (~7 days) |
 | `FREEZE_DELAY` | 60 blocks (~3 minutes) |
-| `VOTE_LIFETIME` | 28,800 blocks (~1 day) |
+| Default `expires` | 28,800 blocks (~1 day) after the message is printed (a `snarkos` default, not a program parameter) |
 | `MAX_FROZEN_DEPLOYMENTS_PER_BLOCK` | 1 |
 | Committee list length | 128 |
 
@@ -49,47 +50,61 @@ Block counts assume ~3 seconds per block.
 
 ### The freeze program
 
-`deployment_freeze.aleo` is an ordinary Aleo program whose constructor rejects every edition after 0.
+`aleo_deployment_freeze.aleo` is built into the protocol like `credits.aleo`: it is never deployed and cannot be upgraded.
 
 | Mapping | Key | Value | Meaning |
 |---|---|---|---|
 | `freeze` | `0u8` | `Freeze { start: u32, end: u32 }` | Frozen when `start <= height < end`. Absent or `end = 0` means not frozen. **The only value consensus reads.** |
-| `votes` | validator `address` | `Vote { proposal: field, cast_at: u32 }` | Each validator's current vote. |
-| `nonce` | `0u8` | `u64` | Incremented each time a proposal passes. |
+| `nonce` | `0u8` | `u64` | Incremented each time a proposal passes. Absent means 0. |
 
-| Function | Effect when it passes |
+A validator votes by signing a **vote message** with its validator key, off chain:
+
+```
+{ aleo_deployment_freeze: true, network: 0u16, action: 1u8, duration: 28800u32, nonce: 3u64, expires: 23500000u32 }
+snarkos account sign --private-key-file <validator key> --message '<vote message>'
+```
+
+`action` is 1 for freeze and 2 for thaw (`duration = 0`); the signature counts while `block.height < expires`. `snarkos account sign` signs the field encoding of the value, which is what `sign.verify` checks, so validators need no new release to vote. The encoding includes member names, so the `aleo_deployment_freeze` member ties the signature to this format. Signatures count together only if they are over the same message, so a coordinator prints it once and sends it to every validator.
+
+Anyone submits the signatures with one function, `submit_votes(members: [address; 128], count: u32, signed: u128, signatures: [signature; 128], vote)`, and pays its fee. Bit `i` of `signed` marks that `members[i]` signed; unsigned slots carry a fixed placeholder.
+
+| Action | Effect when it passes |
 |---|---|
-| `vote_freeze(duration: u32)`, `duration > FREEZE_DELAY` | `end = block.height + min(duration, MAX_FREEZE_BLOCKS)`. If a passed freeze has not yet ended, `start` is kept; otherwise `start = block.height + FREEZE_DELAY`. |
-| `vote_thaw()` | `start = 0`, `end = 0` |
+| Freeze, `duration > FREEZE_DELAY` | `end = block.height + min(duration, MAX_FREEZE_BLOCKS)`. If a passed freeze has not yet ended (including during its delay), `start` is kept; otherwise `start = block.height + FREEZE_DELAY`. |
+| Thaw | `start = 0`, `end = 0` |
 
-Both functions take the full committee list (`members: [address; 128]` plus a count) and pass `self.caller` to finalize, which:
+The function checks each set slot's signature against `members[i]` and `vote`. Finalize then:
 
-1. **Records the vote.** Requires `self.caller` in `credits.aleo/committee`, then sets `votes[self.caller] = (BHP256(action, duration, nonce), block.height)`, with `duration = 0` for a thaw.
-2. **Checks the list is the whole committee.** The count equals the committee size in `credits.aleo/metadata` and is at most 128; every address is in the committee; addresses cast to `field` are strictly increasing.
-3. **Tallies.** `total` is the sum of `credits.aleo/delegated[v]` over the list. `support` sums the same over validators whose vote matches this proposal and is younger than `VOTE_LIFETIME`.
-4. **Applies.** If `support >= total * 2 / 3 + 1`, applies the action and increments `nonce`.
+1. **Checks the message.** `network` is the network ID, `nonce` equals the stored nonce, `block.height < expires`, and the action and duration are valid.
+2. **Checks the list is the whole committee.** The count equals the committee size in `credits.aleo/metadata` and is at most 128; every address is in the committee; addresses cast to `field` are strictly increasing; no bit of `signed` at index `>= count` is set.
+3. **Tallies.** `total` is the sum of `credits.aleo/delegated[v]` over the list, and `support` the same over signers. Delegators count through their validator.
+4. **Applies.** If `support >= total * 2 / 3 + 1`, applies the action and increments `nonce`. Otherwise finalize fails and nothing changes.
 
-Finalize processes all 128 slots and masks those at index `>= count`, because it cannot skip registers after a `branch`.
+Every submission checks all 128 signature slots and list slots, masking those at index `>= count`, because a function has no branches and finalize cannot read registers after a skipped `branch`. Signatures are checked in the function, not finalize, where 128 `sign.verify` calls would exceed `TRANSACTION_SPEND_LIMIT`.
 
 Properties:
 
-- The crossing vote applies the result; there is no separate tally transaction. Stake is read fresh on each vote, so any validator can re-vote to recount.
+- Nothing is stored per validator: a submission carries a quorum or fails. Stake is read at finalize.
 - A new freeze replaces the current one, so renewal (longer or shorter) is just another vote.
-- The nonce invalidates older votes, so a thaw cannot be undone by stale freeze votes. Validators that leave the committee stop counting.
-- Votes count for `self.caller`, not `self.signer`, so a program a validator happens to sign for cannot cast its vote.
+- The nonce invalidates signatures once any proposal passes, so a thaw cannot be undone by stale freeze signatures. `expires` stops old signatures being submitted weeks later. Validators that leave the committee stop counting.
+- A signature covers one exact message, unlike `self.signer`, which a validator would lend to every program it runs, so there is no confused-deputy risk.
 - The tally uses the committee in `credits.aleo` at finalize time, which can briefly differ from the committee AleoBFT uses. This is harmless: the result is one committed value that every node reads identically.
 
-A proof of concept measured 2,587 finalize commands and 3 mapping writes per function, a cost of about 0.08 credits (76,167 microcredits), and a program size of ~110 kB (deployable from `V14`). A committee above 128 would need a new program.
+A proof of concept with a full 128-slot list measured `submit_votes` at 1,374,023 constraints (about 40 seconds to prove; only the submitter proves), 63,911 microcredits of finalize compute with 2 mapping writes, a total fee of about 0.22 credits, and a transaction of ~30 kB. A committee above 128 would need a new program version.
 
-#### Pinning
+#### A built-in program
 
-The program is deployed **before** the release that activates `V_F`, so its name cannot be taken. The release pins the program ID, checksum, and edition 0. If the program on chain does not match at `V_F`, nodes treat the network as never frozen. The pin ignores the amendment count: an amendment changes only verifying keys, which must still pass the certificate check against the pinned program text, so it cannot change behavior.
+- **Loading.** Every node loads the program from its source in snarkVM at edition 0. The verifying key of `submit_votes` for each network is committed beside the source, and a test checks it against a fresh synthesis.
+- **The name.** Deployments of names containing "aleo" have been refused since `V7`, so nobody can take the ID.
+- **The lock.** Like `credits.aleo`, `VM::check_transaction` refuses any deployment, upgrade, or amendment naming it (`synthesizer/src/vm/verify.rs:221`).
+- **Before `V_F`.** The program is loaded but unusable: `check_transaction` refuses any transaction that calls it (including nested or dynamic calls) and any deployment that imports it, and its mappings do not exist.
+- **At `V_F`.** The first block of `V_F` creates the two mappings, empty, as part of its finalize root. Submissions are accepted from the next block.
 
-From block `V_F` (gated on the height of the block being built), the program is locked like `credits.aleo`: `VM::check_transaction` refuses any deployment naming it, and `finalize_deployment` refuses any amendment to it. No vote can change the program's rules; that requires a new program and a network upgrade.
+No vote can change the program's rules; that requires a new program and a network upgrade.
 
 ### Consensus rule
 
-For a block at height `H` with `CONSENSUS_VERSION(H) >= V_F`, let `F = deployment_freeze.aleo/freeze[0u8]` in the **committed** state after block `H − 1`. If `F.start <= H < F.end`, every `Transaction::Deploy` in the block is **frozen**.
+For a block at height `H` with `CONSENSUS_VERSION(H) >= V_F`, let `F = aleo_deployment_freeze.aleo/freeze[0u8]` in the **committed** state after block `H − 1`. If `F.start <= H < F.end`, every `Transaction::Deploy` in the block is **frozen**.
 
 A frozen deployment is checked without touching its program, circuits, or keys. It is **aborted** (as an invalid transaction is today) unless all of the following hold:
 
@@ -127,28 +142,31 @@ From the block after a freeze passes until `end`, nodes:
 - never admit or gossip them;
 - drop deployments queued before the freeze, without charge.
 
-Wallets and SDKs should check `GET /{network}/program/deployment_freeze.aleo/mapping/freeze/0u8` before deploying. This policy assumes snarkOS checks transactions before admitting or gossiping them (verify-before-gossip and fee-first admission), a prerequisite for this ARC.
+Wallets and SDKs should check `GET /{network}/program/aleo_deployment_freeze.aleo/mapping/freeze/0u8` before deploying. This policy assumes snarkOS checks transactions before admitting or gossiping them (verify-before-gossip and fee-first admission), a prerequisite for this ARC.
 
 ### `snarkos` command
 
 ```
-snarkos developer deployment-freeze status --endpoint <node>
-snarkos developer deployment-freeze freeze --private-key-file <key> [--duration 28800] --endpoint <node> --broadcast
-snarkos developer deployment-freeze thaw   --private-key-file <key> --endpoint <node> --broadcast
+snarkos developer deployment-freeze payload --action freeze|thaw [--duration 28800] [--expires-in 28800] --endpoint <node>
+snarkos account sign --private-key-file <validator key> --message '<vote message>'
+snarkos developer deployment-freeze tally   --payload '<vote message>' --signatures <file> --endpoint <node>
+snarkos developer deployment-freeze submit  --payload '<vote message>' --signatures <file> --private-key-file <funded key> --endpoint <node> --broadcast
+snarkos developer deployment-freeze status  --endpoint <node>
 ```
 
-`status` shows the freeze, nonce, and support for each open proposal. `freeze` and `thaw` fetch and sort the committee, then build and broadcast the vote, with the same fee options as `developer execute`. A single default duration keeps validators' votes matching. Operators should keep a few credits in the validator's public balance for vote fees, since rewards are auto-bonded.
+`payload` reads the network ID, nonce, and tip height and prints the vote message. `tally` checks the collected signatures offline against `/committee/latest` and prints signed stake against the threshold, flagging bad, duplicate, and non-member signatures. `submit` runs the same checks, refuses to send short of the threshold or before `V_F`, builds the sorted list, mask, and signature array, and sends `submit_votes` with the same fee options as `developer execute`. If the committee changes before finalize, it can rebuild and resend with the same signatures. `status` shows the freeze, nonce, committee, and threshold. Validators pay nothing; the submitter pays about 0.22 credits.
 
 ### Activation
 
-1. Deploy `deployment_freeze.aleo` and confirm its checksum.
-2. Release `V_F` with the consensus rule, the pin, and the `snarkos` command.
+1. Release `V_F` with the consensus rule, the built-in program, and the `snarkos` command.
+2. The first block of `V_F` creates the program's mappings, empty. Nothing is frozen until validators vote.
+3. From the next block, signatures can be submitted.
 
-The release must not ship before step 1 is confirmed: from `V_F`, the program can never be deployed, and a squatted name never matches the pin. Votes cast before `V_F` take effect at `V_F` if their window is still open.
+There is no deployment step, and the network starts `V_F` unfrozen.
 
 ### Usage
 
-**Emergency:** validators are alerted through the usual upgrade channels, each runs `freeze`, renews if needed, and runs `thaw` once the fix is live. Operators should practice on testnet.
+**Emergency:** validators are alerted through the usual upgrade channels. A coordinator prints the vote message with `payload`, each operator signs it and returns the signature, and anyone runs `submit` once `tally` shows the threshold. Renewals and the thaw work the same way. Operators need no funds, but should keep the validator key reachable for signing and practice on testnet.
 
 **Rollout:** a consensus-version guard remains the default. A freeze is for changes where a guard is impractical, mainly curve and field code inside the gadgets. The precondition is that no deployment already on chain changes verdict under the new code (via a guard or a census of confirmed deployments). Then validators freeze, upgrade, and thaw once non-upgraded stake is negligible. Release notes requesting a freeze should explain why a guard was not used.
 
@@ -158,17 +176,18 @@ The release must not ship before step 1 is confirmed: from `V_F`, the program ca
 - A frozen deployment is aborted, uncharged, for each failed check: bad fee proof, fee below the minimum, fee for another ID, bad owner signature or program owner, version 1, a second frozen deployment in the block, or claimed circuit sizes that overflow. A fee exactly at the minimum is rejected and charged.
 - Builder blocks with frozen `RejectedDeploy`s pass `check_speculate` without verifying the deployment. A block carrying a frozen deployment as accepted fails before `check_transactions`.
 - A frozen deployment's stack is never built, and an execution of an existing program `P` after a frozen deployment of `P` in the same block is accepted.
-- Boundaries: heights `h − 1` to `h + 2` around a vote in block `h`, with a vote and a deployment in the same block in both orders; `start` and `end`; a deployment certified before the vote and committed as late as GC allows; renewals that shorten, or that keep `start` during the freeze or its delay; activation at `V_F`, including a freeze voted earlier and a pin mismatch; and refusal of any deployment of the program from block `V_F`.
-- Program: non-committee votes fail; forged lists fail (missing, duplicate, unsorted, non-member, wrong count, count above 128); support one microcredit below the threshold fails and at the threshold passes; different durations do not combine; expired, pre-nonce, and departed-validator votes do not count; and a 128-entry vote fits under `TRANSACTION_SPEND_LIMIT`.
-- Node: during a freeze, clients and validators refuse deployments over REST and from peers without admitting or forwarding them, and accept them again after a thaw or expiry. `status` matches the program's tally.
+- Boundaries: heights `h − 1` to `h + 2` around a vote in block `h`, with a vote and a deployment in the same block in both orders; `start` and `end`; a deployment certified before the vote and committed as late as GC allows; renewals that shorten, or that keep `start` during the freeze or its delay; activation at `V_F`.
+- Built-in program: before `V_F`, submissions and deployments importing it are refused and its mappings do not exist; the first block of `V_F` creates them, a submission in the next block passes, and a restarted VM keeps them. Any deployment, edition, or amendment of it is refused before and after `V_F`. The committed verifying keys match a fresh synthesis on each network.
+- Program: a `snarkos account sign` signature over the vote message verifies, and a different signer, changed value, or reordered members do not; submissions fail with a bad signature in a set slot, a set bit at index `>= count`, the wrong network, a stale nonce, or an expired message; forged lists fail (missing, duplicate, unsorted, non-member, wrong count, count above 128); support one microcredit below the threshold fails and at the threshold passes; signatures over a passed nonce cannot be resubmitted; and a 128-entry submission fits under `TRANSACTION_SPEND_LIMIT` and the constraint limit.
+- Node: during a freeze, clients and validators refuse deployments over REST and from peers without admitting or forwarding them, and accept them again after a thaw or expiry. The message from `payload` signed by `snarkos account sign` verifies, and `tally` matches the program.
 
 ## Reference Implementations
 
-A proof of concept of `deployment_freeze.aleo` produced the measurements above. Links to it and to the snarkVM and snarkOS changes will be added.
+A proof of concept of `aleo_deployment_freeze.aleo` produced the measurements above. Links to it and to the snarkVM and snarkOS changes will be added.
 
 ## Dependencies
 
-- **snarkVM:** consensus version `V_F`, the consensus rule, and the program pin and lock.
+- **snarkVM:** consensus version `V_F`, the consensus rule, and the built-in program and its lock.
 - **snarkOS:** node policy, the `deployment-freeze` command, and verify-before-gossip / fee-first admission.
 - **Wallets, SDKs, explorers:** should surface the freeze state.
 
@@ -180,17 +199,18 @@ This is a consensus change active from `V_F`; validators must upgrade before it 
 
 - **Power granted.** A two-thirds quorum can stop deployments for up to 7 days at a time and renew. It cannot affect executions, transfers, or staking, or change the program. That quorum can already halt the chain or censor any transaction, so the vote adds no new power, only a faster, uniformly enforced way to use it.
 - **Impact.** Deployments are rare: 102 in the 90 days to 2026-11-05 (no deployments on 54 of those days), and none on 260 of the past 365 days. During a freeze, program owners cannot ship upgrades (even incident fixes), and height-bounded upgrade windows can be missed. Validators should announce each freeze with its reason and end height.
-- **Validator failures.** A compromised key casts one vote and cannot reach the threshold alone. If more than a third of stake is unreachable, no freeze can pass, and any active freeze expires on its own.
-- **Proof-system flaws.** Votes are executions, so an attacker able to forge proofs could forge a thaw. Validators should watch `freeze[0u8]` during incidents and re-vote if it changes unexpectedly.
+- **Validator failures.** A compromised key signs one vote and cannot reach the threshold alone. If more than a third of stake is unreachable, no freeze can pass, and any active freeze expires on its own.
+- **Signed votes.** A signature cannot be withdrawn: anyone holding it can submit it until `expires` or until the nonce moves, so validators should sign only messages they want counted and coordinators should keep `expires` short. A coordinator can sit on signatures but do nothing else with them, and validators can hand the same signatures to another submitter. Network, nonce, and expiry prevent replay, and the sorted list gives each member one slot.
+- **Proof-system flaws.** Submissions are executions with the signature checks inside the proof, so an attacker able to forge proofs could forge a thaw. Validators should watch `freeze[0u8]` during incidents and re-vote if it changes unexpectedly.
 - **Scope.** A freeze does not affect already-deployed programs (including helpers deployed earlier, or dynamic dispatch), `snark.verify` with runtime verifying keys, or built-in circuits. It narrows an attacker's options; it is not a fix.
 
 ### Alternatives considered
 
 - **Guardian set:** faster, but needs seat selection, key custody, and a capture override (itself a validator vote).
-- **Off-chain signature bundle:** one transaction, but needs a collector and a large signature-verification circuit.
+- **Per-validator on-chain votes:** no collector and visible progress, but every validator needs a public credits balance (rewards are auto-bonded) and must send a transaction; operators asked for the sign-a-message flow they already use for ARC votes.
 - **Validator-local flag:** no consensus change, but cannot make rollouts safe.
 - **Abort instead of reject:** opens a free path onto the chain.
-- **Built-in program:** avoids pinning, but needs new machinery and moves state out of an auditable program.
+- **Deployed program:** needs no machinery to create mappings at a height, but must be deployed before the release reveals its name, its deploying key must be guarded (e.g. by a multisig) until the lock applies, and the release must pin its checksum.
 - **Exempt key-only amendments:** amendments still run synthesis and the certificate check, which are exactly what Motivations 1–3 cannot trust.
 - **Tally in consensus code:** the freeze window would derive from vote history instead of one committed value.
 
@@ -198,7 +218,7 @@ This is a consensus change active from `V_F`; validators must upgrade before it 
 
 1. **Lower freeze threshold.** One third of stake would be faster, but would let such a coalition censor deployments without halting the chain, a new power.
 2. **Default duration.** One day by default; rollouts may want 12 hours and emergencies longer.
-3. **`VOTE_LIFETIME`.** One day spans time zones; shorter limits staleness.
+3. **Default expiry.** One day lets signatures be collected across time zones; shorter limits how long an unsubmitted signature stays usable.
 4. **Peer message version.** Bumping it at `V_F` would stop old nodes relaying frozen deployments, at the cost of disconnecting every non-upgraded node.
 
 ## References
